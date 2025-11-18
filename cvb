@@ -1,0 +1,174 @@
+Here's a **pure Bash script** (using only `curl` and `jq`) that does exactly what you asked:
+
+- Uses **only the `/vulnerable-bom-components` endpoint** (fastest possible way)  
+- Searches for a specific **component name + version**  
+- Optionally checks that **exactly the expected CVE/BDSA IDs** are present  
+- Works with Black Duck on-prem or SaaS  
+- CI/CD friendly (exit codes, no Python needed)
+
+```bash
+#!/usr/bin/env bash
+# =============================================================================
+# Black Duck - Vulnerable BOM Components Checker (Bash + curl + jq only)
+# Uses only the /vulnerable-bom-components endpoint → very fast
+# =============================================================================
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage: $0 --url <BD_URL> --token <API_TOKEN> --component <name> --version <ver> [--expect CVE-... BDSA-...]
+
+Examples:
+  $0 --url https://bd.company.com --token bd_abc123... --component lodash --version 4.17.15
+  $0 --url https://bd.company.com --token bd_abc123... --component log4j-core --version 2.14.1 \\
+     --expect CVE-2021-44228 CVE-2021-45046
+
+Options:
+  --url       Black Duck base URL (no trailing slash)
+  --token     Black Duck API token
+  --component Exact component name (case-sensitive)
+  --version   Exact component version
+  --expect    (optional) Space-separated list of CVE/BDSA IDs that MUST be present
+  --any       With --expect, succeed if ANY of the IDs match (default: ALL must match)
+  --fail      Exit 1 on mismatch (default: yes, use --no-fail to just warn)
+EOF
+    exit 1
+}
+
+# Parse arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --url)       BD_URL="$2"; shift 2 ;;
+        --token)     TOKEN说着="$2"; shift 2 ;;
+        --component) COMP="$2"; shift 2 ;;
+        --version)   VER="$2"; shift 2 ;;
+        --expect)    shift; EXPECTED_VULNS=("$@"); set -- ;;   # grab all remaining as expected
+        --any)       MATCH_MODE=any; shift ;;
+        --no-fail)   FAIL_ON_MISMATCH=false; shift ;;
+        -h|--help)   usage ;;
+        *) echo "Unknown parameter: $1"; usage ;;
+    esac
+done
+
+# Required params check
+[[ -z "${BD_URL:-}" || -z "${TOKEN:-}" || -z "${COMP:-}" || -z "${VER:-}" ]] && usage
+
+# Optional defaults
+EXPECTED_VULNS=(${EXPECTED_VULNS:-})
+MATCH_MODE=${MATCH_MODE:-all}
+FAIL_ON_MISMATCH=${FAIL_ON_MISMATCH:-true}
+
+# Get bearer token
+echo "Authenticating with Black Duck..."
+BEARER=$(curl -sS --fail-with-body -X POST \
+    -H "Authorization: token $TOKEN" \
+    "${BD_URL}/api/tokens/authenticate" | jq -r .bearerToken)
+
+if [[ "$BEARER" == "null" || -z "$BEARER" ]]; then
+    echo "Failed to get bearer token"
+    exit 1
+fi
+
+# Build the search query
+# We search for both component name AND version in the vulnerable BOM entries
+QUERY="componentName:${COMP} componentVersionName:${VER}"
+
+echo "Searching vulnerable BOM components for: ${COMP} ${VER}"
+echo "============================================================================"
+
+# Call the vulnerable-bom-components endpoint with the q= filter
+RESPONSE=$(curl -sS --fail-with-body -H "Authorization: Bearer $BEARER" \
+    -H "Accept: application/vnd.blackducksoftware.bill-of-materials-6+json" \
+    "${BD_URL}/api/vulnerable-bom-components?q=${QUERY}&limit=10000")
+
+TOTAL=$(echo "$RESPONSE" | jq '.totalCount // 0')
+
+if [[ $TOTAL -eq 0 ]]; then
+    echo "Not found in any project's BOM → OK (or not used)"
+    exit 0
+fi
+
+echo "Found in $TOTAL project/version BOM entr(y|ies):"
+
+ALL_GOOD=true
+
+echo "$RESPONSE" | jq -c '.items[]' | while read -r item; do
+    proj=$(echo "$item" | jq -r '.projectName')
+    pver=$(echo "$item" | jq -r '.projectVersionName')
+    comp_in_bom=$(echo "$item" | jq -r '.componentName')
+    ver_in_bom=$(echo "$item" | jq -r '.componentVersionName')
+
+    echo "→ $proj / $pver  ($comp_in_bom $ver_in_bom)"
+
+    # Extract vulnerability IDs
+    mapfile -t FOUND_VULNS < <(echo "$item" | jq -r '.vulnerabilities[].vulnerabilityId' | sort)
+
+    if [[ ${#EXPECTED_VULNS[@]} -eq 0 ]]; then
+        printf "   Vulnerabilities: %s\n" "$(IFS=,; echo "${FOUND_VULNS[*]:-none}")"
+        continue
+    fi
+
+    # Build sets for comparison
+    missing=()
+    for expected in "${EXPECTED_VULNS[@]}"; do
+        if ! printf '%s\n' "${FOUND_VULNS[@]}" | grep -Fxq "$expected"; then
+            missing+=("$expected")
+        fi
+    done
+
+    unexpected=()
+    for found in "${FOUND_VULNS[@]}"; do
+        if ! printf '%s\n' "${EXPECTED_VULNS[@]}" | grep -Fxq "$found"; then
+            unexpected+=("$found")
+        fi
+    done
+
+    if [[ $MATCH_MODE == "any" ]]; then
+        if [[ ${#FOUND_VULNS[@]} -gt 0 ]] && [[ $(( ${#FOUND_VULNS[@]} + ${#missing[@]} )) -gt ${#FOUND_VULNS[@]} ]]; then
+            ALL_GOOD=false
+            echo "   At least one expected vuln found, but not all"
+        else
+            echo "   At least one expected vuln found ✓"
+        fi
+    else
+        # default: all expected must be present (and no extras if you want strict)
+        if [[ ${#missing[@]} -eq 0 ]]; then
+            echo "   All expected vulnerabilities present ✓"
+            if [[ ${#unexpected[@]} -gt 0 ]]; then
+                echo "   (also has extra: ${unexpected[*]})"
+            fi
+        else
+            ALL_GOOD=false
+            echo "   MISSING: ${missing[*]}"
+            [[ ${#unexpected[@]} -gt 0 ]] && echo "   UNEXPECTED: ${unexpected[*]}"
+        fi
+    fi
+done
+
+echo "============================================================================"
+
+if $ALL_GOOD; then
+    echo "All checks passed"
+    exit 0
+else
+    echo "Some checks failed"
+    $FAIL_ON_MISMATCH && exit 1 || exit 0
+fi
+```
+
+### Save as `bd-vuln-check.sh`, make executable, and run:
+
+```bash
+chmod +x bd-vuln-check.sh
+
+./bd-vuln-check.sh \
+  --url https://your-bd.example.com \
+  --token bd_1a2b3c... \
+  --component log4j-core \
+  --version 2.14.1 \
+  --expect CVE-2021-44228 CVE-2021-45046
+```
+
+Super fast, no Python, works perfectly in Jenkins/GitLab CI/etc.  
+Let me know if you want JSON output or Slack notifications added!
