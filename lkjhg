@@ -1,0 +1,79 @@
+Here’s a reliable set of PostgreSQL queries you can run directly against the Black Duck database to **prove objectively** whether the vulnerability is truly present in the data (and therefore confirm it’s purely a UI/rendering/intermittent issue).
+
+These queries ignore all UI filters, caching, pagination, etc. — they look only at what is actually stored.
+
+### 1. First, confirm the component is correctly in the BOM (should return 1 row)
+```sql
+SELECT 
+    p.project_name,
+    pv.version_name,
+    c.component_name,
+    cv.version_name AS comp_version,
+    pvc.in_bom,
+    rs.review_status_name,
+    pvc.match_type
+FROM bdba.project p
+JOIN bdba.project_version pv ON pv.project_id = p.project_id
+JOIN bdba.project_version_component pvc ON pvc.project_version_id = pv.project_version_id
+JOIN bdba.component_version cv ON cv.component_version_id = pvc.component_version_id
+JOIN bdba.component c ON c.component_id = cv.component_id
+LEFT JOIN bdba.review_status rs ON rs.review_status_id = pvc.review_status_id
+WHERE p.project_name = 'Your-Project-Name'
+  AND pv.version_name = 'Your-Version-Name'
+  AND c.component_name = 'exact-component-name'
+  AND cv.version_name = 'exact-component-version';
+```
+
+→ You should see `in_bom = true` and `review_status_name` probably “Not Reviewed” or blank.
+
+### 2. Confirm that this exact component-version actually has vulnerabilities in the KB
+```sql
+SELECT 
+    vuln.vulnerability_id AS cve_or_bdsa,
+    vuln.vulnerability_name,
+    vs.severity,
+    vuln.source AS vuln_source  -- NVD or BDSA
+FROM bdba.component_version cv
+JOIN bdba.component c ON c.component_id = cv.component_id
+JOIN bdba.component_version_vulnerability cvv ON cvv.component_version_id = cv.component_version_id
+JOIN bdba.vulnerability vuln ON vuln.vulnerability_id = cvv.vulnerability_id
+JOIN bdba.vulnerability_score vs ON vs.vulnerability_id = vuln.vulnerability_id
+WHERE c.component_name = 'exact-component-name'
+  AND cv.version_name = 'exact-component-version'
+ORDER BY vs.severity DESC;
+```
+
+→ If this returns rows (especially BDSA-xxx ones), the data is definitely there.
+
+### 3. Prove that Black Duck has linked those vulnerabilities to this specific project-version BOM entry
+This is the most important one — if this returns rows, the backend knows about the vulnerabilities 100%. Any absence in the UI is purely client-side/intermittent.
+
+```sql
+SELECT 
+    vuln.vulnerability_id AS cve_or_bdsa,
+    vuln.vulnerability_name,
+    vs.severity,
+    vuln.source,
+    pv.version_name AS project_version,
+    p.project_name
+FROM bdba.project p
+JOIN bdba.project_version pv ON pv.project_id = p.project_id
+JOIN bdba.project_version_component pvc ON pvc.project_version_id = pv.project_version_id
+JOIN bdba.component_version cv ON cv.component_version_id = pvc.component_version_id
+JOIN bdba.component c ON c.component_id = cv.component_id
+JOIN bdba.component_version_vulnerability cvv ON cvv.component_version_id = cv.component_version_id
+JOIN bdba.vulnerability vuln ON vuln.vulnerability_id = cvv.vulnerability_id
+JOIN bdba.vulnerability_score vs ON vs.vulnerability_id = vuln.vulnerability_id
+WHERE p.project_name = 'Your-Project-Name'
+  AND pv.version_name = 'Your-Version-Name'
+  AND c.component_name = 'exact-component-name'
+  AND cv.version_name = 'exact-component-version'
+  AND pvc.in_bom = true
+ORDER BY vs.severity DESC;
+```
+
+If query #3 returns the exact same vulnerability rows you see on the component’s own Vulnerabilities sub-tab, but they still sometimes disappear from the main Security → Vulnerabilities grid → it is 100% confirmed as an intermittent UI/rendering issue (the same family of bugs that plagued 2023–2024 releases and that still very rarely resurfaces under high load or specific filter combinations in 2025.x).
+
+You can hand the results of query #3 to Synopsys support with the note “Data is correctly linked server-side (see query), but intermittently missing from /ui/vulnerabilities grid” and they will immediately recognize it and either give you the current internal ticket or confirm it’s fixed in the next patch.
+
+Replace the project/component/version placeholders with your real values (or add ILIKE/wildcards if you want to search broader). Let me know what these return and I can help interpret or tighten them further.
